@@ -505,67 +505,13 @@ function postToDiscord(data, channelIcon, discordChannelId) {
     wait: true,
     content: `[${data.description_text}](${youtube_url}${data.videoId})`,
   };
+  var options = {
+    'method' : 'post',
+    'contentType': type,
+    'payload': JSON.stringify(message),
+  };
   try {
-    // Discord側のレート制限(429)や一時的なブロック(error code: 1015)を回避するため、
-    // muteHttpExceptionsでレスポンスを受け取り、Retry-After等に従ってリトライする。
-    var options = {
-      method: 'post',
-      contentType: type,
-      payload: JSON.stringify(message),
-      muteHttpExceptions: true,
-    };
-
-    const maxRetries = 5;
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      const response = UrlFetchApp.fetch(discordWebhookUrl, options);
-      const status = response.getResponseCode();
-
-      // 2xx は成功扱い
-      if (status >= 200 && status < 300) {
-        return;
-      }
-
-      // 429: レート制限。Retry-After(秒) またはボディの retry_after(ms) を優先して待機。
-      if (status === 429 && attempt < maxRetries) {
-        const headers = response.getHeaders ? response.getHeaders() : {};
-        const retryAfterHeader = headers['Retry-After'] || headers['retry-after'];
-
-        let waitMs = 0;
-        if (retryAfterHeader) {
-          const retryAfterSeconds = Number(retryAfterHeader);
-          if (!Number.isNaN(retryAfterSeconds) && retryAfterSeconds > 0) {
-            waitMs = Math.ceil(retryAfterSeconds * 1000);
-          }
-        }
-
-        if (!waitMs) {
-          try {
-            const body = response.getContentText() || '';
-            const parsed = JSON.parse(body);
-            const retryAfterMs = Number(parsed && parsed.retry_after);
-            if (!Number.isNaN(retryAfterMs) && retryAfterMs > 0) {
-              waitMs = Math.ceil(retryAfterMs);
-            }
-          } catch (_) {
-            // JSONでない/パース失敗は無視し、フォールバックの待機へ。
-          }
-        }
-
-        // フォールバック: 指数バックオフ + 少しジッター
-        if (!waitMs) {
-          waitMs = Math.min(30000, 1000 * Math.pow(2, attempt));
-        }
-        waitMs += Math.floor(Math.random() * 250);
-
-        console.warn(`Discord webhook rate limited (429). wait=${waitMs}ms attempt=${attempt + 1}/${maxRetries + 1}`);
-        Utilities.sleep(waitMs);
-        continue;
-      }
-
-      // 429以外の非成功は、本文も出して原因を追えるようにする
-      const responseText = response.getContentText ? response.getContentText() : '';
-      throw new Error(`Discord webhook failed. status=${status} body=${responseText}`);
-    }
+    UrlFetchApp.fetch(discordWebhookUrl, options);
   } catch(e) {
     console.error(`エラーが発生しました - 関数名: ${e.functionName}, エラーメッセージ: ${e.message}`);
   }
