@@ -512,8 +512,8 @@ function postToDiscord(data, channelIcon, discordChannelId) {
   };
   try {
     UrlFetchApp.fetch(discordWebhookUrl, options);
-  } catch(e) {
-    console.error(`エラーが発生しました - 関数名: ${e.functionName}, エラーメッセージ: ${e.message}`);
+  } catch (e) {
+    console.error(`エラーが発生しました - エラーメッセージ: ${e.message}, スタックトレース: ${e.stack}`);
   }
 }
 
