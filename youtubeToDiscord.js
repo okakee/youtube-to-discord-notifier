@@ -223,19 +223,7 @@ function processChannelFeed(channelName, channelId, channels, channelIcon, disco
         let formattedActualStartTime = actualStartTime ? formatDate(actualStartTime) : '';
         let APILiveBroadcastContent = liveBroadcastContent;
 
-        newVideoDataRows.push([
-          feedTitle,
-          feedPublished,
-          feedUpdated,
-          feedVideoId,
-          channel,
-          APILiveBroadcastContent,
-          formattedScheduledStartTime,
-          formattedActualStartTime,
-          convertedDuration
-        ]);
-
-        postToDiscord({
+        const discordResult = postToDiscord({
           channel: channel,
           title: feedTitle,
           videoId: feedVideoId,
@@ -245,6 +233,34 @@ function processChannelFeed(channelName, channelId, channels, channelIcon, disco
             convertedDuration
           )
         }, channelIcon, discordChannelId);
+
+        if (discordResult.success) {
+          newVideoDataRows.push([
+            feedTitle,
+            feedPublished,
+            feedUpdated,
+            feedVideoId,
+            channel,
+            APILiveBroadcastContent,
+            formattedScheduledStartTime,
+            formattedActualStartTime,
+            convertedDuration
+          ]);
+        } else if (discordResult.rateLimited) {
+          console.log(`Discord 429のため、videoId=${feedVideoId} のスプレッドシート書き込みをスキップします。`);
+        } else {
+          newVideoDataRows.push([
+            feedTitle,
+            feedPublished,
+            feedUpdated,
+            feedVideoId,
+            channel,
+            APILiveBroadcastContent,
+            formattedScheduledStartTime,
+            formattedActualStartTime,
+            convertedDuration
+          ]);
+        }
       } else {
         let SheetLiveBroadcastContent = liveBroadcastContent;
         const data = [feedTitle, feedPublished, feedUpdated, feedVideoId, channel, SheetLiveBroadcastContent, scheduledStartTime ? scheduledStartTime : ''];
@@ -371,6 +387,33 @@ function fetchVideoInfo(videoId) {
   }
 }
 
+// スプレッドシートのビデオ行データを取得する関数（429エラー時のロールバック用）
+function getVideoRowSnapshot(videoId) {
+  const sheet = spreadsheet.getSheetByName(videoDataSheetName);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 1) {
+    return null;
+  }
+
+  const videoIdColumnData = getSpreadsheetData(sheet, `D1:D${lastRow}`);
+  const rowIndex = videoIdColumnData.findIndex(row => row[0] == videoId) + 1;
+  if (rowIndex === 0) {
+    return null;
+  }
+
+  return {
+    rowIndex: rowIndex,
+    values: sheet.getRange(rowIndex, 1, rowIndex, 9).getValues()[0]
+  };
+}
+
+// スプレッドシートのビデオ行データをロールバックする関数
+function rollbackVideoInfoInSheet(rowIndex, previousValues) {
+  const sheet = spreadsheet.getSheetByName(videoDataSheetName);
+  sheet.getRange(rowIndex, 1, rowIndex, previousValues.length).setValues([previousValues]);
+  console.log(`Discord 429のため、行 ${rowIndex} のスプレッドシート更新をロールバックしました。`);
+}
+
 // スプレッドシートに最新のビデオ情報を更新する関数
 function updateVideoInfoInSheet(title, feedPublished, feedUpdated, videoId, apiLiveBroadcastContent, scheduledStartTime, actualStartTime, apiDuration) {
   const videoDataSheet = spreadsheet.getSheetByName(videoDataSheetName);
@@ -461,18 +504,25 @@ function updateChecker(data, channelIcon, discordChannelId) {
           isChanged = true;
         }
 
+        const previousRowData = getVideoRowSnapshot(feedVideoId);
+
         // 最新の情報をスプレッドシートに更新
         updateVideoInfoInSheet(apiTitle, feedPublished, feedUpdated, feedVideoId, apiLiveBroadcastContent, apiScheduledStartTime, apiActualStartTime, apiDuration);
 
         // 変更があった場合のみDiscordに投稿
         if (isChanged) {
-          postToDiscord({
+          const discordResult = postToDiscord({
             channel: channel,
             title: apiTitle,
             videoId: feedVideoId,
             description_text: description
           }, channelIcon, discordChannelId);
-          Utilities.sleep(400);
+
+          if (discordResult.rateLimited && previousRowData) {
+            rollbackVideoInfoInSheet(previousRowData.rowIndex, previousRowData.values);
+          } else if (discordResult.success) {
+            Utilities.sleep(400);
+          }
         }
       } else {
         // 変更がない場合の処理
@@ -506,14 +556,30 @@ function postToDiscord(data, channelIcon, discordChannelId) {
     content: `[${data.description_text}](${youtube_url}${data.videoId})`,
   };
   var options = {
-    'method' : 'post',
+    'method': 'post',
     'contentType': type,
     'payload': JSON.stringify(message),
+    'muteHttpExceptions': true,
   };
+
   try {
-    UrlFetchApp.fetch(discordWebhookUrl, options);
+    const response = UrlFetchApp.fetch(discordWebhookUrl, options);
+    const statusCode = response.getResponseCode();
+
+    if (statusCode === 429) {
+      console.error(`Discord rate limit (429): ${response.getContentText()}`);
+      return { success: false, rateLimited: true };
+    }
+
+    if (statusCode < 200 || statusCode >= 300) {
+      console.error(`Discord webhook failed (${statusCode}): ${response.getContentText()}`);
+      return { success: false, rateLimited: false };
+    }
+
+    return { success: true, rateLimited: false };
   } catch (e) {
     console.error(`エラーが発生しました - エラーメッセージ: ${e.message}, スタックトレース: ${e.stack}`);
+    return { success: false, rateLimited: false };
   }
 }
 
