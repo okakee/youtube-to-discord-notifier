@@ -1,3 +1,7 @@
+forked from [tatsumin39/youtube-to-discord-notifier](https://github.com/tatsumin39/youtube-to-discord-notifier)
+
+---
+
 # YouTube Channel Feed Automation
 
 English follows Japanese.
