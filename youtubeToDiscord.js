@@ -5,12 +5,10 @@ const youtubeRssUrlPrefix = "https://www.youtube.com/feeds/videos.xml?channel_id
 const youtubeNamespace = XmlService.getNamespace('yt', 'http://www.youtube.com/xml/schemas/2015');
 const atom = XmlService.getNamespace('http://www.w3.org/2005/Atom');
 
-// 日付をフォーマットする関数
+// 日付をフォーマットする関数（空・未設定の日付はnullを返す）
 function formatDate(dateString, format = 'YYYY-MM-DDTHH:mm:ss') {
-  // 日付文字列の有効性をチェック
-  if (!dateString) {
-    console.error(`無効な日付 "${dateString}" がformatDate関数に渡されました。`);
-    return null; // 無効な入力に対してはnullを返す
+  if (dateString === null || dateString === undefined || dateString === false || dateString === '') {
+    return null;
   }
 
   // dayjsを使用して日付をフォーマット
@@ -403,14 +401,14 @@ function getVideoRowSnapshot(videoId) {
 
   return {
     rowIndex: rowIndex,
-    values: sheet.getRange(rowIndex, 1, rowIndex, 9).getValues()[0]
+    values: sheet.getRange(rowIndex, 1, 1, 9).getValues()[0]
   };
 }
 
 // スプレッドシートのビデオ行データをロールバックする関数
 function rollbackVideoInfoInSheet(rowIndex, previousValues) {
   const sheet = spreadsheet.getSheetByName(videoDataSheetName);
-  sheet.getRange(rowIndex, 1, rowIndex, previousValues.length).setValues([previousValues]);
+  sheet.getRange(rowIndex, 1, 1, previousValues.length).setValues([previousValues]);
   console.log(`Discord 429のため、行 ${rowIndex} のスプレッドシート更新をロールバックしました。`);
 }
 
@@ -422,10 +420,10 @@ function updateVideoInfoInSheet(title, feedPublished, feedUpdated, videoId, apiL
   const rowIndex = videoIdColumnData.findIndex(row => row[0] == videoId) + 1;
 
   // 各値をフォーマットしてスプレッドシートに設定
-  const formattedScheduledStartTime = formatDate(scheduledStartTime);
-  const formattedActualStartTime = formatDate(actualStartTime);
-  const formattedFeedPublished = formatDate(feedPublished);
-  const formattedFeedUpdated = formatDate(feedUpdated);
+  const formattedScheduledStartTime = formatDate(scheduledStartTime) || '';
+  const formattedActualStartTime = formatDate(actualStartTime) || '';
+  const formattedFeedPublished = formatDate(feedPublished) || '';
+  const formattedFeedUpdated = formatDate(feedUpdated) || '';
 
   videoDataSheet.getRange(rowIndex, 1).setValue(title);
   videoDataSheet.getRange(rowIndex, 2).setValue(formattedFeedPublished);
@@ -444,7 +442,7 @@ function updateChecker(data, channelIcon, discordChannelId) {
   if (sheetLiveBroadcastContent == 'upcoming' || sheetLiveBroadcastContent == 'live') {
     try {
       const videoDataSheet = spreadsheet.getSheetByName(videoDataSheetName);
-      const videoIdsFromSheet = videoDataSheet.getRange(1, 4, videoDataSheet.getLastRow()).getValues();
+      const videoIdsFromSheet = videoDataSheet.getRange(1, 4, videoDataSheet.getLastRow(), 1).getValues();
       const index = videoIdsFromSheet.flat().indexOf(feedVideoId);
       const sheetVideoLastUpdated = formatDate(videoDataSheet.getRange(index + 1, 3).getValue());
       const sheetTitle = videoDataSheet.getRange(index + 1, 1).getValue();
@@ -463,10 +461,10 @@ function updateChecker(data, channelIcon, discordChannelId) {
           return;
         }
 
-        const formattedSheetScheduledStartTime = formatDate(sheetScheduledStartTime);
+        const formattedSheetScheduledStartTime = formatDate(sheetScheduledStartTime) || '';
         const apiLiveBroadcastContent = apiVideoInfo.liveBroadcastContent;
-        const apiScheduledStartTime = formatDate(apiVideoInfo.scheduledStartTime);
-        const apiActualStartTime = formatDate(apiVideoInfo.actualStartTime);
+        const apiScheduledStartTime = formatDate(apiVideoInfo.scheduledStartTime) || '';
+        const apiActualStartTime = formatDate(apiVideoInfo.actualStartTime) || '';
         const apiTitle = apiVideoInfo.title;
         const apiDuration = convertDurationToHHMMSS(apiVideoInfo.duration);
 
@@ -477,7 +475,11 @@ function updateChecker(data, channelIcon, discordChannelId) {
 
         // Live状態が変化しているか
         if (sheetLiveBroadcastContent != apiLiveBroadcastContent) {
-          description = description_text(apiLiveBroadcastContent, apiActualStartTime, apiDuration);
+          description = description_text(
+            apiLiveBroadcastContent,
+            apiActualStartTime || formattedSheetScheduledStartTime,
+            apiDuration
+          );
           console.log(`Live状態が ${sheetLiveBroadcastContent} から ${apiLiveBroadcastContent} に変更されました。`);
           isChanged = true;
 
@@ -507,7 +509,16 @@ function updateChecker(data, channelIcon, discordChannelId) {
         const previousRowData = getVideoRowSnapshot(feedVideoId);
 
         // 最新の情報をスプレッドシートに更新
-        updateVideoInfoInSheet(apiTitle, feedPublished, feedUpdated, feedVideoId, apiLiveBroadcastContent, apiScheduledStartTime, apiActualStartTime, apiDuration);
+        updateVideoInfoInSheet(
+          apiTitle,
+          feedPublished,
+          feedUpdated,
+          feedVideoId,
+          apiLiveBroadcastContent,
+          apiVideoInfo.scheduledStartTime,
+          apiVideoInfo.actualStartTime,
+          apiDuration
+        );
 
         // 変更があった場合のみDiscordに投稿
         if (isChanged) {
@@ -534,46 +545,63 @@ function updateChecker(data, channelIcon, discordChannelId) {
   }
 }
 
-// Discordにメッセージを投稿する関数
+// Discordにメッセージを投稿する関数（AWS Lambda経由でWebhookへ中継）
 function postToDiscord(data, channelIcon, discordChannelId) {
-  const type = 'application/json';
-  // discordChannelIdが提供されているかチェックし、適切なWebhook URLを取得
-  let discordWebhookUrl;
-  if (discordChannelId && discordChannelId.trim() !== '') {
-    discordWebhookUrl = PropertiesService.getScriptProperties().getProperty(discordChannelId);
-  } else {
-    // ここでデフォルトのDiscord Webhook URLのプロパティ名を指定
-    discordWebhookUrl = PropertiesService.getScriptProperties().getProperty('discordWebhookUrl');
-  }
-  const youtube_url = 'https://www.youtube.com/watch?v='
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const relayUrl = scriptProperties.getProperty('DISCORD_RELAY_URL');
+  const relayToken = scriptProperties.getProperty('RELAY_TOKEN');
 
-  var message = {
+  if (!relayUrl || !relayToken) {
+    console.error('DISCORD_RELAY_URL または RELAY_TOKEN がスクリプトプロパティに設定されていません。');
+    return { success: false, rateLimited: false };
+  }
+
+  const youtube_url = 'https://www.youtube.com/watch?v=';
+  const webhookKey = (discordChannelId && discordChannelId.trim() !== '') ? discordChannelId.trim() : null;
+
+  const message = {
     username: data.channel,
-    avatar_url: channelIcon || "https://www.youtube.com/s/desktop/28b0985e/img/favicon_144x144.png",
+    avatar_url: channelIcon || 'https://www.youtube.com/s/desktop/28b0985e/img/favicon_144x144.png',
     tts: false,
     title: data.title,
     wait: true,
     content: `[${data.description_text}](${youtube_url}${data.videoId})`,
   };
-  var options = {
-    'method': 'post',
-    'contentType': type,
-    'payload': JSON.stringify(message),
-    'muteHttpExceptions': true,
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      Authorization: 'Bearer ' + relayToken,
+    },
+    payload: JSON.stringify({
+      webhookKey: webhookKey,
+      payload: message,
+    }),
+    muteHttpExceptions: true,
   };
 
   try {
-    const response = UrlFetchApp.fetch(discordWebhookUrl, options);
+    const response = UrlFetchApp.fetch(relayUrl, options);
     const statusCode = response.getResponseCode();
+    const responseText = response.getContentText();
 
     if (statusCode === 429) {
-      console.error(`Discord rate limit (429): ${response.getContentText()}`);
+      console.error(`Discord rate limit via relay (429): ${responseText}`);
       return { success: false, rateLimited: true };
     }
 
     if (statusCode < 200 || statusCode >= 300) {
-      console.error(`Discord webhook failed (${statusCode}): ${response.getContentText()}`);
-      return { success: false, rateLimited: false };
+      let rateLimited = false;
+      try {
+        const responseBody = JSON.parse(responseText);
+        rateLimited = responseBody.rateLimited === true;
+      } catch (parseError) {
+        // レスポンスがJSONでない場合は rateLimited のまま false
+      }
+
+      console.error(`Discord relay failed (${statusCode}): ${responseText}`);
+      return { success: false, rateLimited: rateLimited };
     }
 
     return { success: true, rateLimited: false };

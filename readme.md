@@ -7,146 +7,252 @@ forked from [tatsumin39/youtube-to-discord-notifier](https://github.com/tatsumin
 English follows Japanese.
 
 ## 概要
-このGoogle Apps Script（GAS）は、YouTubeチャンネルの動画投稿や配信情報（配信予定、配信中、アーカイブ動画つまり配信終了）をDiscordチャンネルに通知することができます。配信情報には、配信予定時刻や配信タイトルの変更も含まれ、これらが変更された際にも通知を行います。
+
+この Google Apps Script（GAS）は、YouTube チャンネルの動画投稿や配信情報（配信予定、配信中、アーカイブ動画）を Discord チャンネルに通知します。配信予定時刻や配信タイトルの変更時にも通知を行います。
+
+Discord への通知は **AWS Lambda Function URL** を経由して送信します。GAS から Discord Webhook を直接叩くと、Google の共有 IP による Cloudflare 制限（429 / 1015）に巻き込まれることがあるため、Lambda で中継する構成にしています。
+
+参考: [GAS→Discord Webhookの429エラーをLambda Function URLを活用して解決した話](https://qiita.com/1987Shiz321/items/d2760ebffabd4b9967b0)
+
+## アーキテクチャ
+
+```
+GAS (youtubeToDiscord.js)
+  → POST Lambda Function URL
+      Authorization: Bearer <RELAY_TOKEN>
+      Body: { webhookKey, payload }
+  → Lambda (lambda/index.mjs)
+      → Discord Webhook URL へ POST
+  → Discord
+```
 
 ## 機能
-- YouTubeチャンネルのRSSフィードから最新の動画情報を取得
-- 取得した動画情報をGoogleスプレッドシートに保存
-- 新しい動画がある場合、Discordに通知を送信
-- チャンネルのアイコンURL更新機能
 
-#### オプション機能：複数のDiscordチャンネルに通知を送信
+- YouTube チャンネルの RSS フィードから最新の動画情報を取得
+- 取得した動画情報を Google スプレッドシートに保存
+- 新しい動画がある場合、Lambda 経由で Discord に通知を送信
+- チャンネルのアイコン URL 更新機能
+- Discord 429 発生時のスプレッドシート整合性維持（新規動画は書き込みスキップ、更新時はロールバック）
 
-この機能を使用すると、複数のDiscordチャンネルに通知を行うことができます。スプレッドシートの「channels」シートに新たな列 `discordChannelId` を追加して、各YouTubeチャンネルに対応するDiscordチャンネルの識別子を記入します。
+#### オプション機能：複数の Discord チャンネルに通知を送信
 
-- `discordChannelId` 列は任意であり、この列が空の場合はGoogle Apps Scriptのセットアップの2. のプロパティ名: `discordWebhookUrl`のDiscord Webhook URLが使用されます。
-- 特定のDiscordチャンネルのWebhook URLは、スクリプトの `PropertiesService` に登録する必要があります。
+スプレッドシートの「channels」シートに `discordChannelId` 列を追加し、各 YouTube チャンネルに対応する識別子を記入します。
 
-この機能により、異なるYouTubeチャンネルに対して異なるDiscordチャンネルに通知を送ることができるようになり、より柔軟な通知システムを実現できます。
+- `discordChannelId` 列が空の場合、Lambda の環境変数 `DISCORD_WEBHOOK_URL`（デフォルト Webhook）が使用されます。
+- 値がある場合、その文字列を `webhookKey` として Lambda に渡し、環境変数 `WEBHOOK_MAP` から Webhook URL を解決します。
 
 ## 使い方
-### Discord Webhookの設定
-1. Discordで、通知を送信したいチャンネルを選択します。
+
+### Discord Webhook の設定
+
+1. Discord で、通知を送信したいチャンネルを選択します。
 2. チャンネルの設定（歯車アイコン）を開き、「連携サービス」を選択します。
-3. 「Webhooks」セクションで「新しいWebhook」をクリックします。
-4. Webhookの名前を設定し、「Webhook URL」をコピーします。
+3. 「Webhooks」セクションで「新しい Webhook」をクリックします。
+4. Webhook の名前を設定し、「Webhook URL」をコピーします。
 
-### Googleスプレッドシートの準備
-1. 新しいGoogleスプレッドシートを作成し、「channels」と「videoData」の2つのシートを準備します。
-   - 「channels」シートで見出し行として、`CHANNEL_NAME`、`CHANNEL_ID`、`CHANNEL_ICON_URL`、`discordChannelId`を設定します。
-   - 「videoData」シートで見出し行として、`title`、`published`、`updated`、`videoId`、`channel`、`live`、`scheduledStartTime`、`actualStartTime`、`duration`を設定します。
+Webhook URL は GAS ではなく **Lambda の環境変数** に設定します（後述）。
 
-### Google Apps Scriptのセットアップ
+### AWS Lambda のセットアップ
+
+1. [AWS Lambda コンソール](https://console.aws.amazon.com/lambda/) で関数を作成します。
+   - ランタイム: **Node.js 22.x**
+   - ハンドラ: `index.handler`（`index.mjs` をルートに配置した場合）
+2. 本リポジトリの [`lambda/index.mjs`](lambda/index.mjs) の内容を Lambda のコードエディタに貼り付けるか、ZIP でアップロードします。
+3. **設定 → 環境変数** に以下を追加します。
+
+   | 環境変数 | 必須 | 説明 |
+   |---|---|---|
+   | `RELAY_TOKEN` | はい | GAS と共有する長いランダム文字列（32 文字以上推奨） |
+   | `DISCORD_WEBHOOK_URL` | はい | デフォルトの Discord Webhook URL |
+   | `WEBHOOK_MAP` | 任意 | 複数 Webhook 用の JSON。例: `{"myDiscordChannel":"https://discord.com/api/webhooks/..."}` |
+
+4. **設定 → 一般設定** でタイムアウトを **10〜30 秒** に延長します（Discord の応答待ち・429 リトライ用）。
+5. **設定 → 関数 URL** で Function URL を作成します。
+   - 認証タイプ: `NONE`（Bearer トークンは Lambda 内で検証）
+   - CORS: オフ（GAS からのサーバー間通信のため通常不要）
+6. 発行された Function URL を控えます（GAS の `DISCORD_RELAY_URL` に設定）。
+
+#### Lambda のテスト
+
+Lambda コンソールの **テスト** タブで、次のようなイベントを使います（`YOUR_RELAY_TOKEN` を環境変数と同じ値に置き換え）。
+
+```json
+{
+  "version": "2.0",
+  "headers": {
+    "authorization": "Bearer YOUR_RELAY_TOKEN",
+    "content-type": "application/json"
+  },
+  "requestContext": {
+    "http": {
+      "method": "POST"
+    }
+  },
+  "body": "{\"webhookKey\":null,\"payload\":{\"username\":\"テスト\",\"content\":\"Lambda relay test\"}}",
+  "isBase64Encoded": false
+}
+```
+
+成功時は `statusCode: 200`、Discord チャンネルにメッセージが届きます。
+
+#### 推奨のセキュリティ設定
+
+- `RELAY_TOKEN` は十分長いランダム文字列にする
+- Function URL とトークンを公開しない
+- 予約済み同時実行数を低めに設定する
+- CloudWatch Logs / Alarm を設定する
+
+### Google スプレッドシートの準備
+
+1. 新しい Google スプレッドシートを作成し、「channels」と「videoData」の 2 つのシートを準備します。
+   - 「channels」シートの見出し行: `CHANNEL_NAME`、`CHANNEL_ID`、`CHANNEL_ICON_URL`、`discordChannelId`
+   - 「videoData」シートの見出し行: `title`、`published`、`updated`、`videoId`、`channel`、`live`、`scheduledStartTime`、`actualStartTime`、`duration`
+
+### Google Apps Script のセットアップ
+
 1. スプレッドシートの「拡張機能」メニューから「Apps Script」を選択します。
-2. Apps Scriptのプロジェクトの設定を開き、スクリプト プロパティに以下の設定を追加します：
-   - プロパティ名: `discordWebhookUrl`、値: Discordで発行したWebhook URL
-   - プロパティ名: `sheetId`、値: 用意したGoogleスプレッドシートのID
-3. 本プロジェクトのスクリプトファイル `youtubeToDiscord.js`をコピーしてスクリプトエディタにペーストします。
-4. スクリプトエディタの「ライブラリ」セクションで、dayjsライブラリを追加します。ライブラリのIDは `1ShsRhHc8tgPy5wGOzUvgEhOedJUQD53m-gd8lG2MOgs-dXC_aCZn9lFB` です。
-5. スクリプトエディタの「サービス」セクションでYouTube Data API v3を有効にします。
-6. (任意) Google Cloud Platformで新しいプロジェクトを作成し、YouTube Data API v3を有効にします。これにより、APIの使用量を監視し、1日あたりの制限に抵触するリスクを管理できます。
-7. (任意) Apps ScriptプロジェクトをGCPプロジェクトに紐づけるため、Apps Scriptの「プロジェクトの設定」から「Google Cloud Platform（GCP）プロジェクト」を選択し、GCPプロジェクトのIDを入力します。
-8. スクリプトを初めて実行する際、画面上の指示に従ってYouTube Data API v3へのアクセス許可を与えます。
+2. Apps Script のプロジェクトの設定を開き、スクリプト プロパティに以下を追加します。
+
+   | プロパティ名 | 値 |
+   |---|---|
+   | `DISCORD_RELAY_URL` | Lambda Function URL |
+   | `RELAY_TOKEN` | Lambda の `RELAY_TOKEN` と同じ値 |
+   | `sheetId` | 用意した Google スプレッドシートの ID |
+
+3. 本プロジェクトの `youtubeToDiscord.js` をスクリプトエディタにペーストします。
+4. スクリプトエディタの「ライブラリ」で dayjs を追加します。ライブラリ ID: `1ShsRhHc8tgPy5wGOzUvgEhOedJUQD53m-gd8lG2MOgs-dXC_aCZn9lFB`
+5. スクリプトエディタの「サービス」で YouTube Data API v3 を有効にします。
+6. （任意）Google Cloud Platform でプロジェクトを作成し、YouTube Data API v3 を有効にします。
+7. （任意）Apps Script プロジェクトを GCP プロジェクトに紐づけます。
+8. 初回実行時、YouTube Data API v3 へのアクセス許可を与えます。
+
+> **注意:** Discord Webhook URL は GAS のスクリプト プロパティには保存しません。Lambda の環境変数で管理してください。
 
 ### トリガーの設定
-1. Apps Scriptの「トリガー」メニューから、新しいトリガーを追加します。
-2. 「実行する関数」で `fetchUpdateAndNotify` を選択します。
-3. 「時間主導型」トリガーを選択し、実行間隔を「5分おき」に設定します。
 
-#### オプション機能用の追加設定
+1. Apps Script の「トリガー」から新しいトリガーを追加します。
+2. 実行する関数: `fetchUpdateAndNotify`
+3. 時間主導型、実行間隔: **5 分おき**
 
-オプション機能「複数のDiscordチャンネルに通知を送信する機能」を使用する場合、各Discordチャンネルに対応するWebhook URLをスクリプト プロパティに追加する必要があります。以下のように設定してください：
+#### オプション機能の追加設定（複数 Discord チャンネル）
 
-- `discordWebhookUrl` はデフォルトのDiscord Webhook URLを指定します。これは、`discordChannelId` 列が空の場合に使用されます。
-- 各特定のDiscordチャンネルのWebhook URLは、それぞれ異なるプロパティ名で追加します。例えば、特定のチャンネルの識別子が `myDiscordChannel` の場合、そのプロパティ名を `myDiscordChannel` とし、値にはそのチャンネルのWebhook URLを設定します。
+1. 「channels」シートの `discordChannelId` 列に識別子を記入します（例: `myDiscordChannel`）。
+2. Lambda の環境変数 `WEBHOOK_MAP` に、その識別子と Webhook URL の対応を追加します。
+
+   ```json
+   {"myDiscordChannel":"https://discord.com/api/webhooks/..."}
+   ```
+
+`discordChannelId` が空の行は、Lambda の `DISCORD_WEBHOOK_URL` が使われます。
 
 ## 注意事項および留意事項
 
+### Lambda 中継について
+
+- Lambda 経由でも Discord 自体のレート制限は残りますが、GAS 共有 IP による Cloudflare 制限の回避が主な目的です。
+- Lambda 側では Discord 429 時に `retry_after` を見て最大 3 回まで再送します。
+- GAS 側では 429 時に新規動画のスプレッドシート書き込みをスキップし、配信状態の更新時はロールバックします。
+
 ### リアルタイム通知について
-- 本システムはリアルタイム通知を保証するものではありません。YouTubeの更新情報のフィードへの反映遅延やトリガー実行のタイミングにより、通知が遅れる可能性があります。
+
+- 本システムはリアルタイム通知を保証しません。YouTube のフィード反映遅延やトリガー実行タイミングにより、通知が遅れることがあります。
 
 ### チャンネル情報の追加と通知
-- スプレッドシートの「channels」シートに新しいチャンネル情報を追加すると、そのチャンネルの過去の動画情報（約5件）が取得され、通知対象となります。
-- 特に初回実行時は、通知が大量に発生する可能性があり、Discordのメッセージ制限に抵触することがあります。この点を考慮して、チャンネル情報の追加とスクリプトの実行タイミングを慎重に管理してください。
+
+- 「channels」シートに新しいチャンネルを追加すると、過去の動画情報（約 5 件）が取得され、通知対象になります。
+- 初回実行時は通知が大量に発生する可能性があります。チャンネル追加と実行タイミングは慎重に管理してください。
 
 ### 配信予定の取り扱い
-- 配信予定が設定されているにもかかわらず配信が行われなかった場合、スプレッドシートの「videoData」シートにおいて、その配信のステータスは `Live` カラムに `upcoming` として残り続けます。これはYouTubeのフィードが更新されないためであり、スクリプトが自動的にステータスを更新しないためです。
+
+- 配信予定が設定されたまま配信が行われなかった場合、「videoData」シートの `live` 列は `upcoming` のまま残ります。YouTube のフィードが更新されないため、スクリプトは自動でステータスを変更しません。
 
 ## ライセンス
+
 [MIT License](LICENSE)
+
+---
 
 ## English Version
 
 ### Overview
-This Google Apps Script (GAS) allows you to notify a Discord channel about new video postings and broadcast information (upcoming broadcasts, live broadcasts, and archived videos meaning broadcast ended) from YouTube channels. The broadcast information includes changes in scheduled times and titles, and notifications will be sent when these are changed.
+
+This Google Apps Script (GAS) notifies Discord channels about new YouTube videos and live stream updates (upcoming, live, archived). It also notifies when scheduled times or stream titles change.
+
+Notifications are sent through an **AWS Lambda Function URL** relay instead of calling Discord Webhooks directly from GAS. This reduces intermittent 429 / Cloudflare 1015 errors caused by Google's shared outbound IPs.
+
+### Architecture
+
+```
+GAS → Lambda Function URL (Bearer token) → Discord Webhook → Discord
+```
 
 ### Features
-- Retrieves the latest video information from the RSS feed of YouTube channels
-- Saves the obtained video information to a Google Spreadsheet
-- Sends notifications to Discord when new videos are available
-- Updates channel icon URL functionality
 
-#### Optional Feature: Sending Notifications to Multiple Discord Channels
+- Fetches latest video info from YouTube RSS feeds
+- Stores video data in Google Spreadsheet
+- Sends Discord notifications via Lambda relay
+- Updates channel icon URLs
+- Preserves spreadsheet consistency on Discord 429 (skip new rows / rollback updates)
 
-By using this feature, you can send notifications to multiple Discord channels. Add a new column `discordChannelId` to the 'channels' sheet in the spreadsheet and enter the identifiers for the Discord channels corresponding to each YouTube channel.
+#### Optional: Multiple Discord Channels
 
-- The `discordChannelId` column is optional, and if this column is empty, the Discord Webhook URL specified in 'Property name: `discordWebhookUrl`' under Google Apps Script Setup, point 2, will be used.
-- The Webhook URL for each specific Discord channel needs to be registered in the script's `PropertiesService`.
-
-This feature allows you to send notifications to different Discord channels for different YouTube channels, enabling a more flexible notification system.
+Add a `discordChannelId` column to the `channels` sheet. When empty, Lambda uses `DISCORD_WEBHOOK_URL`. When set, the value is sent as `webhookKey` and resolved via Lambda's `WEBHOOK_MAP` environment variable.
 
 ### How to Use
-#### Setting Up Discord Webhook
-1. In Discord, select the channel where you want to send notifications.
-2. Open the channel settings (gear icon) and select the 'Integrations' tab.
-3. In the 'Webhooks' section, click on 'New Webhook'.
-4. Set the name for the Webhook and copy the 'Webhook URL'.
 
-#### Preparing Google Spreadsheet
-1. Create a new Google Spreadsheet and prepare two sheets: 'channels' and 'videoData'.
-   - In the 'channels' sheet, set the header row with `CHANNEL_NAME`, `CHANNEL_ID`, `CHANNEL_ICON_URL`.
-   - In the 'videoData' sheet, set the header row with `title`, `published`, `updated`, `videoId`, `channel`, `live`, `scheduledStartTime`, `actualStartTime`, `duration`.
+#### Discord Webhook
 
-### Google Apps Script Setup
-1. From the 'Extensions' menu in the spreadsheet, select 'Apps Script'.
-2. Open the project settings in Apps Script and add the following script properties:
-   - Property name: `discordWebhookUrl`, Value: The Webhook URL issued by Discord
-   - Property name: `sheetId`, Value: The ID of the prepared Google Spreadsheet
-3. Copy the script file `youtubeToDiscord.js` of this project and paste it into the script editor.
-4. In the 'Library' section of the script editor, add the dayjs library. The library ID is `1ShsRhHc8tgPy5wGOzUvgEhOedJUQD53m-gd8lG2MOgs-dXC_aCZn9lFB`.
-5. Enable YouTube Data API v3 in the 'Services' section of the script editor.
-6. (Optional) Create a new project in Google Cloud Platform and enable YouTube Data API v3. This allows you to monitor API usage and manage the risk of hitting daily limits.
-7. (Optional) To link the Apps Script project with the GCP project, select 'Google Cloud Platform (GCP) Project' in the 'Project Settings' of Apps Script and enter the ID of the GCP project.
-8. When running the script for the first time, follow the on-screen instructions to grant access to YouTube Data API v3.
+Create a Webhook in Discord and copy the URL. Store it in Lambda environment variables (not in GAS).
 
-#### Setting Up Triggers
-1. From the 'Triggers' menu in Apps Script, add a new trigger.
-2. Select `fetchUpdateAndNotify` for 'Choose which function to run'.
-3. Choose 'Time-driven' trigger and set the execution interval to 'Every 5 minutes'.
+#### AWS Lambda Setup
 
-#### Additional Settings for the Optional Feature
+1. Create a Lambda function (Node.js 22.x).
+2. Deploy [`lambda/index.mjs`](lambda/index.mjs).
+3. Set environment variables:
+   - `RELAY_TOKEN` (required): shared secret with GAS
+   - `DISCORD_WEBHOOK_URL` (required): default Discord Webhook URL
+   - `WEBHOOK_MAP` (optional): JSON map of keys to Webhook URLs
+4. Set timeout to 10–30 seconds.
+5. Create a Function URL (auth type: `NONE`; token is validated inside Lambda).
+6. Copy the Function URL for GAS `DISCORD_RELAY_URL`.
 
-When using the optional feature 'Sending Notifications to Multiple Discord Channels', you need to add the Webhook URL for each Discord channel to the script properties. Set it up as follows:
+#### Google Spreadsheet
 
-- `discordWebhookUrl` specifies the default Discord Webhook URL, which is used when the `discordChannelId` column is empty.
-- The Webhook URL for each specific Discord channel should be added with a different property name. For example, if the identifier for a specific channel is `myDiscordChannel`, set the property name to `myDiscordChannel` and specify that channel's Webhook URL as its value.
+Create `channels` and `videoData` sheets with headers:
 
-### Notes and Considerations
+- `channels`: `CHANNEL_NAME`, `CHANNEL_ID`, `CHANNEL_ICON_URL`, `discordChannelId`
+- `videoData`: `title`, `published`, `updated`, `videoId`, `channel`, `live`, `scheduledStartTime`, `actualStartTime`, `duration`
 
-#### Real-time Notifications
-- This system does not guarantee real-time notifications. There may be delays in notifications due to the reflection delay of YouTube's update information feed and the timing of trigger execution.
+#### Google Apps Script Setup
 
-#### Adding Channel Information and Notifications
-- Adding new channel information to the 'channels' sheet in the spreadsheet will retrieve past video information (about 5 items) of that channel and make them the subject of notifications.
-- Especially during the initial execution, a large number of notifications may be generated, which may conflict with Discord's message limits. Consider this when adding channel information and managing the timing of script execution.
+Script properties:
 
-#### Handling Scheduled Broadcasts
-- If a scheduled broadcast is set but does not take place, the status of that broadcast will remain as 'upcoming' in the `Live` column of the 'videoData' sheet. This is because the YouTube feed is not updated, and the script does not automatically update the status.
+| Property | Value |
+|---|---|
+| `DISCORD_RELAY_URL` | Lambda Function URL |
+| `RELAY_TOKEN` | Same as Lambda `RELAY_TOKEN` |
+| `sheetId` | Spreadsheet ID |
+
+Then paste `youtubeToDiscord.js`, add the dayjs library, and enable YouTube Data API v3.
+
+#### Triggers
+
+Run `fetchUpdateAndNotify` every 5 minutes (time-driven trigger).
+
+#### Optional: Multiple Discord Channels
+
+Set `discordChannelId` in the spreadsheet and add matching entries to Lambda `WEBHOOK_MAP`.
+
+### Notes
+
+- Lambda relay mainly avoids GAS shared-IP Cloudflare limits; Discord rate limits may still apply.
+- Lambda retries Discord 429 up to 3 times using `retry_after`.
+- GAS skips spreadsheet writes on 429 for new videos and rolls back updates when status notifications fail.
 
 ### Language Note
-The `youtubeToDiscord.js` script uses Japanese for notification messages to Discord, comments, and debugging console.log statements. As the Japanese used is basic, please feel free to replace it with your preferred language as needed.
 
+`youtubeToDiscord.js` uses Japanese for Discord messages, comments, and logs. Feel free to replace them with your preferred language.
 
 ## License
-[MIT License](LICENSE)
 
+[MIT License](LICENSE)
