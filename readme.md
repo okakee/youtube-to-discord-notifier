@@ -28,11 +28,13 @@ GAS (youtubeToDiscord.js)
 
 ## 機能
 
-- YouTube チャンネルの RSS フィードから最新の動画情報を取得
+- YouTube Data API v3 のアップロード一覧から最新5件を取得（RSS不使用）
+- 保存済みの配信予定・配信中の動画は、最新5件から外れても API で追跡
+- `status.privacyStatus` が `public`（公開）の動画のみ通知・更新対象です。非公開・限定公開・公開状態不明の動画は除外し、既存行は保持します。
 - 取得した動画情報を Google スプレッドシートに保存
 - 新しい動画がある場合、Lambda 経由で Discord に通知を送信
 - チャンネルのアイコン URL 更新機能
-- Discord 429 発生時のスプレッドシート整合性維持（新規動画は書き込みスキップ、更新時はロールバック）
+- Discord 送信失敗時のスプレッドシート整合性維持（新規動画は書き込みスキップ、更新時はロールバック）
 
 #### オプション機能：複数の Discord チャンネルに通知を送信
 
@@ -128,6 +130,15 @@ Lambda コンソールの **テスト** タブで、次のようなイベント�
 
 > **注意:** Discord Webhook URL は GAS のスクリプト プロパティには保存しません。Lambda の環境変数で管理してください。
 
+### RSS版からの移行とAPI利用量
+
+- `youtubeToDiscord.js` を差し替え、既存の YouTube Data API v3 サービスを有効にしたまま実行してください。追加の API キーは不要です。
+- 既存のシート、通知済み動画ID、スクリプトプロパティ、トリガーをそのまま利用できます。`updated` 列はRSS更新日時からAPI確認時刻に変わります。
+- `channels.list` で取得したアップロード一覧IDは `uploadsPlaylistId:<チャンネルID>` というスクリプトプロパティに自動保存します。
+- 通常は1チャンネル・1実行あたり `playlistItems.list` 1回と `videos.list` 1回（最大50動画の一括取得）です。5分間隔で約576ユニット/日/チャンネル。初回取得、アイコン取得、追跡動画が50件を超える場合の追加呼び出しは別途必要です。
+- 新着探索は最新5件に限定されます。実行間隔中に5件を超える追加があると見逃す可能性があります。必要に応じてコード先頭の `recentVideoLimit` を50以下で増やしてください（初回通知件数も増えます）。
+- 新しい配信予定はアップロード一覧に現れてから検知します。配信予約の網羅的・即時検知は保証しません。
+
 ### トリガーの設定
 
 1. Apps Script の「トリガー」から新しいトリガーを追加します。
@@ -151,11 +162,11 @@ Lambda コンソールの **テスト** タブで、次のようなイベント�
 
 - Lambda 経由でも Discord 自体のレート制限は残りますが、GAS 共有 IP による Cloudflare 制限の回避が主な目的です。
 - Lambda 側では Discord 429 時に `retry_after` を見て最大 3 回まで再送します。
-- GAS 側では 429 時に新規動画のスプレッドシート書き込みをスキップし、配信状態の更新時はロールバックします。
+- GAS 側では送信失敗時に新規動画のスプレッドシート書き込みをスキップし、配信状態の更新時はロールバックして次回再試行します。
 
 ### リアルタイム通知について
 
-- 本システムはリアルタイム通知を保証しません。YouTube のフィード反映遅延やトリガー実行タイミングにより、通知が遅れることがあります。
+- 本システムはリアルタイム通知を保証しません。YouTube Data API の反映遅延やトリガー実行タイミングにより、通知が遅れることがあります。
 
 ### チャンネル情報の追加と通知
 
@@ -164,7 +175,7 @@ Lambda コンソールの **テスト** タブで、次のようなイベント�
 
 ### 配信予定の取り扱い
 
-- 配信予定が設定されたまま配信が行われなかった場合、「videoData」シートの `live` 列は `upcoming` のまま残ります。YouTube のフィードが更新されないため、スクリプトは自動でステータスを変更しません。
+- 配信予定・配信中の動画は毎回APIで確認します。削除・非公開などでAPIに返らない動画や、取得に失敗した動画は既存状態を保持します。配信中止を推測して変更しないため、`upcoming` のまま残る場合があります。
 
 ## ライセンス
 
@@ -188,11 +199,13 @@ GAS → Lambda Function URL (Bearer token) → Discord Webhook → Discord
 
 ### Features
 
-- Fetches latest video info from YouTube RSS feeds
+- Fetches the latest 5 uploads using YouTube Data API v3 only; no RSS requests
+- Continues polling stored upcoming/live videos even after they leave the latest uploads
+- Only public videos are eligible for notifications and updates. Private, unlisted, and unknown privacy status videos are excluded, preserving existing rows.
 - Stores video data in Google Spreadsheet
 - Sends Discord notifications via Lambda relay
 - Updates channel icon URLs
-- Preserves spreadsheet consistency on Discord 429 (skip new rows / rollback updates)
+- Preserves spreadsheet consistency on Discord delivery failures (skip new rows / rollback updates)
 
 #### Optional: Multiple Discord Channels
 
@@ -235,6 +248,8 @@ Script properties:
 
 Then paste `youtubeToDiscord.js`, add the dayjs library, and enable YouTube Data API v3.
 
+Existing installations can replace the script without changing sheets, properties, or triggers. No additional API key is required. The `updated` column now stores API check time. Upload playlist IDs are cached automatically in script properties. A typical poll costs 2 units per channel (about 576 units/day at 5-minute intervals), plus channel lookups and additional batches beyond 50 tracked videos. Discovery covers the latest 5 uploads; increase `recentVideoLimit` up to 50 if needed. New scheduled streams are detected only once exposed in the uploads playlist. Missing/private/deleted videos retain their stored state.
+
 #### Triggers
 
 Run `fetchUpdateAndNotify` every 5 minutes (time-driven trigger).
@@ -247,7 +262,7 @@ Set `discordChannelId` in the spreadsheet and add matching entries to Lambda `WE
 
 - Lambda relay mainly avoids GAS shared-IP Cloudflare limits; Discord rate limits may still apply.
 - Lambda retries Discord 429 up to 3 times using `retry_after`.
-- GAS skips spreadsheet writes on 429 for new videos and rolls back updates when status notifications fail.
+- GAS skips spreadsheet writes for new videos and rolls back updates when notifications fail, allowing retries on the next run.
 
 ### Language Note
 

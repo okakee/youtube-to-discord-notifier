@@ -1,9 +1,61 @@
-// YouTubeのRSS URLのプレフィックス
-const youtubeRssUrlPrefix = "https://www.youtube.com/feeds/videos.xml?channel_id=";
+// 新着の取得件数（従来と同じ5件）。取得済みの配信予定・配信中動画は別途追跡する。
+const recentVideoLimit = 5;
+let channels = [];
+let videoApiCache = {};
 
-// XML名前空間の定義
-const youtubeNamespace = XmlService.getNamespace('yt', 'http://www.youtube.com/xml/schemas/2015');
-const atom = XmlService.getNamespace('http://www.w3.org/2005/Atom');
+// 公開動画のみ通知・更新する（非公開・限定公開・公開状態不明は除外）。
+function isVideoVisible(video) {
+  return !!video.status && video.status.privacyStatus === 'public';
+}
+
+function fetchChannelVideos(channelId, channelName) {
+  const properties = PropertiesService.getScriptProperties();
+  const cacheKey = 'uploadsPlaylistId:' + channelId;
+  let playlistId = properties.getProperty(cacheKey);
+  const ids = new Set();
+  try {
+    if (!playlistId) {
+      const response = YouTube.Channels.list('contentDetails', { id: channelId });
+      const channel = response.items && response.items[0];
+      if (!channel) throw new Error('チャンネルが見つかりません');
+      playlistId = channel.contentDetails.relatedPlaylists.uploads;
+      if (!playlistId) throw new Error('アップロード一覧が見つかりません');
+      properties.setProperty(cacheKey, playlistId);
+    }
+    const response = YouTube.PlaylistItems.list('contentDetails', {
+      playlistId: playlistId,
+      maxResults: recentVideoLimit
+    });
+    (response.items || []).forEach(item => ids.add(item.contentDetails.videoId));
+  } catch (error) {
+    console.error(`新着一覧の取得失敗 (${channelId}): ${error.message}`);
+  }
+
+  // 最新5件から外れた動画も、配信が終了するまでは状態を確認する。
+  globalSheetData.forEach(row => {
+    if (row[4] === channelName && (row[5] === 'upcoming' || row[5] === 'live')) {
+      ids.add(row[3]);
+    }
+  });
+  const videoIds = Array.from(ids).filter(Boolean);
+  const videos = [];
+  for (let i = 0; i < videoIds.length; i += 50) {
+    const batch = videoIds.slice(i, i + 50);
+    try {
+      const response = YouTube.Videos.list('snippet,liveStreamingDetails,contentDetails,status', {
+        id: batch.join(',')
+      });
+      (response.items || []).forEach(video => {
+        if (!isVideoVisible(video)) return;
+        videoApiCache[video.id] = video;
+        videos.push(video);
+      });
+    } catch (error) {
+      console.error(`動画情報の取得失敗 (${channelId}): ${error.message}`);
+    }
+  }
+  return videos;
+}
 
 // 日付をフォーマットする関数（空・未設定の日付はnullを返す）
 function formatDate(dateString, format = 'YYYY-MM-DDTHH:mm:ss') {
@@ -48,7 +100,7 @@ const videoDataSheetName = 'videoData';
 const videoDataSheet = spreadsheet.getSheetByName(videoDataSheetName);
 
 // スプレッドシートのデータを一度取得して保持
-const globalSheetData = getSpreadsheetData(videoDataSheet, videoDataSheet.getDataRange().getA1Notation());
+let globalSheetData = [];
 
 // URLがアクセス可能かどうかを確認する関数
 function isUrlAccessible(url) {
@@ -95,6 +147,7 @@ function updateChannelIcon(channelId) {
         break;
       }
     }
+    return channelIconUrl;
   } catch (e) {
     console.error(`チャンネルID ${channelId} のアイコン更新中にエラーが発生しました: ${e.message}`);
   }
@@ -158,6 +211,7 @@ function loadAndVerifyChannelData() {
   for (let i = 2; i <= lastRow; i++) {
     const row = getSpreadsheetData(channelsSheet, `${i}:${i}`)[0];
     const channelId = row[1];
+    if (!channelId) continue;
     const channelIconUrl = row[2];
     const discordChannelId = row[3];
 
@@ -186,14 +240,10 @@ function processChannelFeed(channelName, channelId, channels, channelIcon, disco
 
   const channel = channelArray[0];
   const videoDataSheet = spreadsheet.getSheetByName('videoData');
-  const channelRssUrl = youtubeRssUrlPrefix + channelId;
   let items;
 
   try {
-    const xml = UrlFetchApp.fetch(channelRssUrl).getContentText();
-    const docs = XmlService.parse(xml);
-    const root = docs.getRootElement();
-    items = root.getChildren('entry', atom).slice(0, 5);
+    items = fetchChannelVideos(channelId, channel);
   } catch (e) {
     Logger.log("エラーが発生しました: " + e.message);
     return false;
@@ -203,10 +253,11 @@ function processChannelFeed(channelName, channelId, channels, channelIcon, disco
 
   if (items) {
     for (let i = 0; i < items.length; i++) {
-      const feedTitle = items[i].getChildText('title', atom);
-      const feedUpdated = formatDate(items[i].getChildText('updated', atom));
-      const feedPublished = formatDate(items[i].getChildText('published', atom));
-      const feedVideoId = items[i].getChildText('videoId', youtubeNamespace);
+      const feedTitle = items[i].snippet.title;
+      // Data APIにRSSのupdated相当はないため、API確認時刻を記録する。
+      const feedUpdated = formatDate(new Date());
+      const feedPublished = formatDate(items[i].snippet.publishedAt);
+      const feedVideoId = items[i].id;
 
       const [isNewVideo, liveBroadcastContent, scheduledStartTime, actualStartTime, convertedDuration] = getVideoInfoFromSheet(globalSheetData, feedVideoId);
 
@@ -246,18 +297,6 @@ function processChannelFeed(channelName, channelId, channels, channelIcon, disco
           ]);
         } else if (discordResult.rateLimited) {
           console.log(`Discord 429のため、videoId=${feedVideoId} のスプレッドシート書き込みをスキップします。`);
-        } else {
-          newVideoDataRows.push([
-            feedTitle,
-            feedPublished,
-            feedUpdated,
-            feedVideoId,
-            channel,
-            APILiveBroadcastContent,
-            formattedScheduledStartTime,
-            formattedActualStartTime,
-            convertedDuration
-          ]);
         }
       } else {
         let SheetLiveBroadcastContent = liveBroadcastContent;
@@ -270,6 +309,7 @@ function processChannelFeed(channelName, channelId, channels, channelIcon, disco
 
   if (newVideoDataRows.length > 0) {
     videoDataSheet.getRange(videoDataSheet.getLastRow() + 1, 1, newVideoDataRows.length, newVideoDataRows[0].length).setValues(newVideoDataRows);
+    globalSheetData.push(...newVideoDataRows);
   }
   return return_info;
 }
@@ -329,9 +369,9 @@ function getVideoInfoFromSheet(sheetData, videoId) {
 function fetchVideoInfo(videoId) {
   try {
     // YouTube APIを使用してビデオの詳細情報を取得
-    const videoApiResponse = YouTube.Videos.list('id, snippet, liveStreamingDetails, contentDetails', {
+    const videoApiResponse = videoApiCache[videoId] ? { items: [videoApiCache[videoId]] } : YouTube.Videos.list('id, snippet, liveStreamingDetails, contentDetails, status', {
       id: videoId,
-      fields: 'items(id, snippet(liveBroadcastContent, title), liveStreamingDetails(scheduledStartTime, actualStartTime, actualEndTime), contentDetails(duration))'
+      fields: 'items(id, snippet(liveBroadcastContent, title), liveStreamingDetails(scheduledStartTime, actualStartTime, actualEndTime), contentDetails(duration), status(privacyStatus))'
     });
 
     if (!videoApiResponse || videoApiResponse.items.length === 0) {
@@ -339,6 +379,7 @@ function fetchVideoInfo(videoId) {
     }
 
     const apiVideoInfo = videoApiResponse.items[0];
+    if (!isVideoVisible(apiVideoInfo)) return null;
     console.log('YouTube.Videos.list API実行:' + apiVideoInfo.snippet.title);
 
     // レスポンスから必要なビデオ情報を抽出
@@ -444,11 +485,10 @@ function updateChecker(data, channelIcon, discordChannelId) {
       const videoDataSheet = spreadsheet.getSheetByName(videoDataSheetName);
       const videoIdsFromSheet = videoDataSheet.getRange(1, 4, videoDataSheet.getLastRow(), 1).getValues();
       const index = videoIdsFromSheet.flat().indexOf(feedVideoId);
-      const sheetVideoLastUpdated = formatDate(videoDataSheet.getRange(index + 1, 3).getValue());
       const sheetTitle = videoDataSheet.getRange(index + 1, 1).getValue();
 
-      // 更新日付が変わっていれば新たにAPIを叩いて情報を取得
-      if (feedUpdated !== sheetVideoLastUpdated) {
+      // 配信状態・タイトル・予定時刻を毎回APIの最新値と比較する。
+      {
         const apiVideoInfo = fetchVideoInfo(feedVideoId);
         if (!apiVideoInfo) {
           console.log(`ビデオ情報が見つかりませんでした - ビデオID: ${feedVideoId}`);
@@ -477,7 +517,7 @@ function updateChecker(data, channelIcon, discordChannelId) {
         if (sheetLiveBroadcastContent != apiLiveBroadcastContent) {
           description = description_text(
             apiLiveBroadcastContent,
-            apiActualStartTime || formattedSheetScheduledStartTime,
+            apiActualStartTime || apiScheduledStartTime,
             apiDuration
           );
           console.log(`Live状態が ${sheetLiveBroadcastContent} から ${apiLiveBroadcastContent} に変更されました。`);
@@ -529,15 +569,12 @@ function updateChecker(data, channelIcon, discordChannelId) {
             description_text: description
           }, channelIcon, discordChannelId);
 
-          if (discordResult.rateLimited && previousRowData) {
+          if (!discordResult.success && previousRowData) {
             rollbackVideoInfoInSheet(previousRowData.rowIndex, previousRowData.values);
           } else if (discordResult.success) {
             Utilities.sleep(400);
           }
         }
-      } else {
-        // 変更がない場合の処理
-        console.log(`${sheetTitle} ビデオID ${feedVideoId}のステータスは変更されませんでした: ${sheetLiveBroadcastContent}`);
       }
     } catch (error) {
       console.error(`updateCheckerでエラーが発生しました - ビデオID: ${feedVideoId}, エラーメッセージ: ${error.message}`);
@@ -618,6 +655,8 @@ function fetchUpdateAndNotify() {
     // ロックを取得しようとする。10秒でタイムアウトを設定。
     if (lock.tryLock(10000)) {
       console.log('スクリプトをロック中です。');
+      globalSheetData = getSpreadsheetData(videoDataSheet, videoDataSheet.getDataRange().getA1Notation());
+      videoApiCache = {};
       // チャンネル情報の初期化やメイン処理の呼び出し
       loadAndVerifyChannelData();
       updateAllChannels();
