@@ -148,7 +148,7 @@ GAS のスクリプトプロパティ `DISCORD_ARCHIVE_MODE` で、全チャン�
 | `post`（未設定時の既定値） | 従来どおり、アーカイブ案内を新規投稿 |
 | `edit` | 配信開始時の投稿を、アーカイブ案内と配信時間に編集 |
 
-導入時は先に `lambda/index.mjs` を Lambda に反映し、その後 `youtubeToDiscord.js` を GAS に反映してください。`edit` を設定すると編集形式に切り替わり、`post` に戻すと新規投稿形式に戻ります。配信終了を検知した時点の設定が適用されます。
+`edit` を設定すると編集形式に切り替わり、`post` に戻すと新規投稿形式に戻ります。配信終了を検知した時点の設定が適用されます。
 
 - 配信開始投稿のメッセージIDと送信先キーを GAS のスクリプトプロパティ `discordLiveMessage:<動画ID>` に自動保存します。シートの列追加は不要です。終了通知の成功後にこの保存情報を削除します。
 - `post` モードでも開始投稿のIDを保存するため、配信途中で `edit` に変更できます。
@@ -272,7 +272,7 @@ Existing installations can replace the script without changing sheets, propertie
 
 Set the GAS script property `DISCORD_ARCHIVE_MODE` to `post` (default when unset) for a new archive post, or `edit` to update the original stream-start post with the archive link and duration. This setting applies to all channels and is read when the end is detected.
 
-Deploy `lambda/index.mjs` first, then update `youtubeToDiscord.js` in GAS. No sheet columns need to change. Start message IDs and webhook keys are stored in script properties (`discordLiveMessage:<videoId>`) in both modes and removed after successful archive delivery. Missing IDs, including streams notified before this update, fall back to new posts. Upcoming, start, and title-change notifications remain new posts. Failed edits preserve the live state and ID for retry; switch to `post` if the original message was deleted. Keep webhook mappings stable while streams are live.
+No sheet columns need to change. Start message IDs and webhook keys are stored in script properties (`discordLiveMessage:<videoId>`) in both modes and removed after successful archive delivery. Missing IDs, including streams notified before this update, fall back to new posts. Upcoming, start, and title-change notifications remain new posts. Failed edits preserve the live state and ID for retry; switch to `post` if the original message was deleted. Keep webhook mappings stable while streams are live.
 
 #### Triggers
 
