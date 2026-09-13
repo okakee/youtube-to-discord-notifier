@@ -284,6 +284,9 @@ function processChannelFeed(channelName, channelId, channels, channelIcon, disco
         }, channelIcon, discordChannelId);
 
         if (discordResult.success) {
+          if (liveBroadcastContent === 'live') {
+            saveLiveMessage(feedVideoId, discordResult.messageId, discordChannelId);
+          }
           newVideoDataRows.push([
             feedTitle,
             feedPublished,
@@ -562,16 +565,27 @@ function updateChecker(data, channelIcon, discordChannelId) {
 
         // 変更があった場合のみDiscordに投稿
         if (isChanged) {
-          const discordResult = postToDiscord({
+          const notification = {
             channel: channel,
             title: apiTitle,
             videoId: feedVideoId,
             description_text: description
-          }, channelIcon, discordChannelId);
+          };
+          const liveMessage = apiLiveBroadcastContent === 'archive' ? getLiveMessage(feedVideoId) : null;
+          const editArchive = PropertiesService.getScriptProperties().getProperty('DISCORD_ARCHIVE_MODE') === 'edit';
+          const discordResult = editArchive && liveMessage
+            ? postToDiscord(notification, channelIcon, liveMessage.webhookKey, liveMessage.messageId)
+            : postToDiscord(notification, channelIcon, discordChannelId);
 
           if (!discordResult.success && previousRowData) {
             rollbackVideoInfoInSheet(previousRowData.rowIndex, previousRowData.values);
           } else if (discordResult.success) {
+            // タイトル変更の通知で開始投稿のIDを上書きしない。
+            if (apiLiveBroadcastContent === 'live' && sheetLiveBroadcastContent !== 'live') {
+              saveLiveMessage(feedVideoId, discordResult.messageId, discordChannelId);
+            } else if (apiLiveBroadcastContent === 'archive') {
+              PropertiesService.getScriptProperties().deleteProperty('discordLiveMessage:' + feedVideoId);
+            }
             Utilities.sleep(400);
           }
         }
@@ -582,8 +596,28 @@ function updateChecker(data, channelIcon, discordChannelId) {
   }
 }
 
-// Discordにメッセージを投稿する関数（AWS Lambda経由でWebhookへ中継）
-function postToDiscord(data, channelIcon, discordChannelId) {
+// 配信開始投稿のIDと送信先を、終了通知が成功するまで保持する。
+function saveLiveMessage(videoId, messageId, webhookKey) {
+  if (!messageId) return;
+  PropertiesService.getScriptProperties().setProperty('discordLiveMessage:' + videoId, JSON.stringify({
+    messageId: String(messageId),
+    webhookKey: webhookKey ? webhookKey.trim() : null
+  }));
+}
+
+function getLiveMessage(videoId) {
+  const value = PropertiesService.getScriptProperties().getProperty('discordLiveMessage:' + videoId);
+  if (!value) return null;
+  try {
+    const message = JSON.parse(value);
+    return typeof message.messageId === 'string' && /^\d+$/.test(message.messageId) ? message : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+// AWS Lambda経由で新規投稿、または指定した開始投稿を編集する。
+function postToDiscord(data, channelIcon, discordChannelId, messageId = null) {
   const scriptProperties = PropertiesService.getScriptProperties();
   const relayUrl = scriptProperties.getProperty('DISCORD_RELAY_URL');
   const relayToken = scriptProperties.getProperty('RELAY_TOKEN');
@@ -601,7 +635,6 @@ function postToDiscord(data, channelIcon, discordChannelId) {
     avatar_url: channelIcon || 'https://www.youtube.com/s/desktop/28b0985e/img/favicon_144x144.png',
     tts: false,
     title: data.title,
-    wait: true,
     content: `[${data.description_text}](${youtube_url}${data.videoId})`,
   };
 
@@ -613,6 +646,8 @@ function postToDiscord(data, channelIcon, discordChannelId) {
     },
     payload: JSON.stringify({
       webhookKey: webhookKey,
+      action: messageId ? 'edit' : 'post',
+      messageId: messageId,
       payload: message,
     }),
     muteHttpExceptions: true,
@@ -641,7 +676,13 @@ function postToDiscord(data, channelIcon, discordChannelId) {
       return { success: false, rateLimited: rateLimited };
     }
 
-    return { success: true, rateLimited: false };
+    let responseBody = {};
+    try {
+      responseBody = JSON.parse(responseText);
+    } catch (error) {
+      // 旧中継との互換性: IDを取得できない開始投稿は、終了時に新規投稿する。
+    }
+    return { success: true, rateLimited: false, messageId: responseBody.messageId || null };
   } catch (e) {
     console.error(`エラーが発生しました - エラーメッセージ: ${e.message}, スタックトレース: ${e.stack}`);
     return { success: false, rateLimited: false };

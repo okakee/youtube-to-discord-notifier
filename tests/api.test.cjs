@@ -24,7 +24,8 @@ function setup(rows = []) {
     console: { log() {}, error() {} }, Logger: { log() {} },
     PropertiesService: { getScriptProperties: () => ({
       getProperty: key => state.properties[key],
-      setProperty: (key, value) => { state.properties[key] = value; }
+      setProperty: (key, value) => { state.properties[key] = value; },
+      deleteProperty: key => { delete state.properties[key]; }
     }) },
     SpreadsheetApp: { openById: () => ({ getSheetByName: () => sheet }) },
     Utilities: { sleep() {} },
@@ -47,7 +48,12 @@ function setup(rows = []) {
   vm.runInContext(source, context);
   context.initialRows = rows.map(row => [...row]);
   vm.runInContext('globalSheetData = initialRows;', context);
-  context.postToDiscord = data => { state.posts.push(data); return { success: state.success, rateLimited: false }; };
+  state.context = context;
+  state.send = context.postToDiscord;
+  context.postToDiscord = (data, icon, webhookKey, messageId) => {
+    state.posts.push({ ...data, webhookKey, messageId });
+    return { success: state.success, rateLimited: false, messageId: state.messageId };
+  };
   state.run = () => context.processChannelFeed('Channel', 'UCtest', [['Channel', 'UCtest']], '', '');
   state.fetchVideo = id => context.fetchVideoInfo(id);
   return state;
@@ -129,4 +135,94 @@ test('failed state notifications restore the previous row', () => {
   state.run();
   assert.deepEqual(state.rows, [original]);
   assert.equal(state.posts.length, 1);
+});
+
+const liveRow = () => ['old', 'published', 'checked', 'old', 'Channel', 'live', '', 'started', '00:00:00'];
+function endedStream(mode, saved = true) {
+  const state = setup([liveRow()]);
+  if (mode) state.properties.DISCORD_ARCHIVE_MODE = mode;
+  if (saved) state.properties['discordLiveMessage:old'] = JSON.stringify({ messageId: '123456789012345678', webhookKey: 'original' });
+  state.videos = [video('old', { actualStartTime: 'started', actualEndTime: 'ended' })];
+  return state;
+}
+
+for (const mode of [undefined, 'post', 'unknown']) {
+  test(`archive mode ${mode} sends a new post and clears the saved ID`, () => {
+    const state = endedStream(mode);
+    state.run();
+    assert.equal(state.posts.length, 1);
+    assert.equal(state.posts[0].messageId, undefined);
+    assert.equal(state.rows[0][5], 'archive');
+    assert.equal(state.properties['discordLiveMessage:old'], undefined);
+  });
+}
+
+test('edit mode edits the start post using its original webhook key', () => {
+  const state = endedStream('edit');
+  state.run();
+  assert.equal(state.posts.length, 1);
+  assert.equal(state.posts[0].messageId, '123456789012345678');
+  assert.equal(state.posts[0].webhookKey, 'original');
+  assert.match(state.posts[0].description_text, /アーカイブはこちら/);
+  assert.equal(state.rows[0][5], 'archive');
+  assert.equal(state.properties['discordLiveMessage:old'], undefined);
+});
+
+test('edit mode without a saved start post falls back to a new post', () => {
+  const state = endedStream('edit', false);
+  state.run();
+  assert.equal(state.posts[0].messageId, undefined);
+  assert.equal(state.rows[0][5], 'archive');
+});
+
+test('failed edits retain both live state and message ID for retry', () => {
+  const state = endedStream('edit');
+  const saved = state.properties['discordLiveMessage:old'];
+  state.success = false;
+  state.run();
+  assert.deepEqual(state.rows[0], liveRow());
+  assert.equal(state.properties['discordLiveMessage:old'], saved);
+  state.success = true;
+  state.run();
+  assert.equal(state.posts[1].messageId, '123456789012345678');
+  assert.equal(state.rows[0][5], 'archive');
+});
+
+for (const initiallyTracked of [false, true]) {
+  test(`saves a start post ID with initiallyTracked=${initiallyTracked}`, () => {
+    const row = liveRow();
+    row[5] = 'upcoming';
+    const state = setup(initiallyTracked ? [row] : []);
+    state.messageId = '123456789012345678';
+    state.uploads = ['old'];
+    state.videos = [video('old', { actualStartTime: 'started' })];
+    state.run();
+    assert.equal(JSON.parse(state.properties['discordLiveMessage:old']).messageId, state.messageId);
+  });
+}
+
+test('live title updates do not overwrite the start post ID', () => {
+  const state = endedStream('edit');
+  state.messageId = '999999999999999999';
+  state.videos = [{ ...video('old', { actualStartTime: 'started' }), snippet: { title: 'new title' } }];
+  state.run();
+  assert.equal(state.posts[0].messageId, undefined);
+  assert.equal(JSON.parse(state.properties['discordLiveMessage:old']).messageId, '123456789012345678');
+});
+
+test('GAS relay sends edit metadata and reads the returned message ID', () => {
+  const state = setup();
+  state.properties.DISCORD_RELAY_URL = 'https://relay.example/';
+  state.properties.RELAY_TOKEN = 'test-token';
+  state.context.UrlFetchApp = { fetch: (url, options) => {
+    assert.equal(url, state.properties.DISCORD_RELAY_URL);
+    const body = JSON.parse(options.payload);
+    assert.equal(body.action, 'edit');
+    assert.equal(body.messageId, '123456789012345678');
+    assert.equal(body.webhookKey, 'original');
+    return { getResponseCode: () => 200, getContentText: () => JSON.stringify({ messageId: body.messageId }) };
+  } };
+  const result = state.send({ channel: 'Channel', videoId: 'old', description_text: 'ended' }, '', 'original', '123456789012345678');
+  assert.equal(result.success, true);
+  assert.equal(result.messageId, '123456789012345678');
 });

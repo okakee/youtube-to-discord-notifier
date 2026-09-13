@@ -139,6 +139,24 @@ Lambda コンソールの **テスト** タブで、次のようなイベント�
 - 新着探索は最新5件に限定されます。実行間隔中に5件を超える追加があると見逃す可能性があります。必要に応じてコード先頭の `recentVideoLimit` を50以下で増やしてください（初回通知件数も増えます）。
 - 新しい配信予定はアップロード一覧に現れてから検知します。配信予約の網羅的・即時検知は保証しません。
 
+### 配信終了時の通知方法を選ぶ
+
+GAS のスクリプトプロパティ `DISCORD_ARCHIVE_MODE` で、全チャンネル共通の動作を選べます。
+
+| 値 | 配信終了を検知したときの動作 |
+|---|---|
+| `post`（未設定時の既定値） | 従来どおり、アーカイブ案内を新規投稿 |
+| `edit` | 配信開始時の投稿を、アーカイブ案内と配信時間に編集 |
+
+導入時は先に `lambda/index.mjs` を Lambda に反映し、その後 `youtubeToDiscord.js` を GAS に反映してください。`edit` を設定すると編集形式に切り替わり、`post` に戻すと新規投稿形式に戻ります。配信終了を検知した時点の設定が適用されます。
+
+- 配信開始投稿のメッセージIDと送信先キーを GAS のスクリプトプロパティ `discordLiveMessage:<動画ID>` に自動保存します。シートの列追加は不要です。終了通知の成功後にこの保存情報を削除します。
+- `post` モードでも開始投稿のIDを保存するため、配信途中で `edit` に変更できます。
+- 導入前の配信など、開始投稿のIDがない場合は、`edit` でも終了時に新規投稿します。
+- 配信予定・配信開始・タイトル変更などの通知は、従来どおり新規投稿です。タイトル変更の投稿で開始投稿のIDを上書きしません。
+- 編集に失敗した場合は配信中の状態とIDを保持し、次回再試行します。開始投稿が削除されている場合は `post` に変更すると新規投稿で処理を完了できます。
+- 配信中は使用した Webhook と `WEBHOOK_MAP` の対応を維持してください。終了の反映は定期実行と YouTube API の反映タイミングに従います。
+
 ### トリガーの設定
 
 1. Apps Script の「トリガー」から新しいトリガーを追加します。
@@ -249,6 +267,12 @@ Script properties:
 Then paste `youtubeToDiscord.js`, add the dayjs library, and enable YouTube Data API v3.
 
 Existing installations can replace the script without changing sheets, properties, or triggers. No additional API key is required. The `updated` column now stores API check time. Upload playlist IDs are cached automatically in script properties. A typical poll costs 2 units per channel (about 576 units/day at 5-minute intervals), plus channel lookups and additional batches beyond 50 tracked videos. Discovery covers the latest 5 uploads; increase `recentVideoLimit` up to 50 if needed. New scheduled streams are detected only once exposed in the uploads playlist. Missing/private/deleted videos retain their stored state.
+
+#### Choose how stream endings are announced
+
+Set the GAS script property `DISCORD_ARCHIVE_MODE` to `post` (default when unset) for a new archive post, or `edit` to update the original stream-start post with the archive link and duration. This setting applies to all channels and is read when the end is detected.
+
+Deploy `lambda/index.mjs` first, then update `youtubeToDiscord.js` in GAS. No sheet columns need to change. Start message IDs and webhook keys are stored in script properties (`discordLiveMessage:<videoId>`) in both modes and removed after successful archive delivery. Missing IDs, including streams notified before this update, fall back to new posts. Upcoming, start, and title-change notifications remain new posts. Failed edits preserve the live state and ID for retry; switch to `post` if the original message was deleted. Keep webhook mappings stable while streams are live.
 
 #### Triggers
 

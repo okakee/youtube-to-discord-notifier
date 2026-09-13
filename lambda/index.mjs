@@ -47,12 +47,19 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function postToDiscord(webhookUrl, payload, maxRetries = 3) {
+async function postToDiscord(webhookUrl, payload, messageId = null, maxRetries = 3) {
   let attempt = 0;
+  const url = new URL(webhookUrl);
+  if (messageId) {
+    url.pathname = url.pathname.replace(/\/$/, '') + '/messages/' + messageId;
+  } else {
+    // waitはJSON本文ではなくクエリパラメーター。作成したメッセージIDを取得する。
+    url.searchParams.set('wait', 'true');
+  }
 
   while (true) {
-    const response = await fetch(webhookUrl, {
-      method: 'POST',
+    const response = await fetch(url.toString(), {
+      method: messageId ? 'PATCH' : 'POST',
       headers: {
         'Content-Type': 'application/json',
         'User-Agent': 'discord-webhook-relay/1.0',
@@ -110,18 +117,30 @@ export const handler = async (event) => {
     }
 
     const request = JSON.parse(event.body);
+    const action = request.action || 'post';
+    if (action !== 'post' && action !== 'edit') {
+      return jsonResponse(400, { error: 'Invalid action' });
+    }
+    if (action === 'edit' && (typeof request.messageId !== 'string' || !/^\d+$/.test(request.messageId))) {
+      return jsonResponse(400, { error: 'Invalid messageId' });
+    }
 
     // GAS から { webhookKey, payload } を受け取る想定
     const webhookKey = request.webhookKey || null;
-    const payload = request.payload || request; // 後方互換: payload だけ送っても可
+    let payload = request.payload || request; // 後方互換: payload だけ送っても可
+    if (action === 'edit') {
+      if (typeof payload.content !== 'string') {
+        return jsonResponse(400, { error: 'Edit requires content' });
+      }
+      payload = { content: payload.content, allowed_mentions: { parse: [] } };
+    }
 
     const webhookUrl = resolveWebhookUrl(webhookKey);
     if (!webhookUrl) {
       return jsonResponse(400, { error: 'Webhook URL not configured' });
     }
 
-    // wait: true は Lambda 側で待てるのでそのまま転送してよい
-    const result = await postToDiscord(webhookUrl, payload);
+    const result = await postToDiscord(webhookUrl, payload, action === 'edit' ? request.messageId : null);
 
     console.log('Discord response:', result.status, JSON.stringify(result.body));
 
@@ -137,6 +156,7 @@ export const handler = async (event) => {
     return jsonResponse(200, {
       ok: true,
       discordStatus: result.status,
+      messageId: result.body?.id || null,
     });
   } catch (err) {
     console.error(err);
